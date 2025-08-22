@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/**
+ * SupplyChain: end-to-end product tracking with checkpoints, ownership, and states.
+ * - Register a product (manufacturer).
+ * - Add checkpoints (any current owner).
+ * - Transfer ownership (manufacturer -> distributor -> retailer -> customer ... arbitrary).
+ * - Change lifecycle state (Created, InTransit, Delivered, Returned, Recalled).
+ * - Query full timeline & current status.
+ *
+ * Notes:
+ * - No external libraries to keep setup simple.
+ * - Role control is minimal: the "currentOwner" is allowed to add checkpoints and transfer.
+ * - You can extend with AccessControl/OpenZeppelin if needed.
+ */
+
+contract SupplyChain {
+    enum State {
+        Created,
+        InTransit,
+        Delivered,
+        Returned,
+        Recalled
+    }
+
+    struct Checkpoint {
+        uint256 time;          // block timestamp
+        address actor;         // who recorded
+        string location;       // freeform (could be gps/city/warehouse code)
+        string note;           // optional metadata (e.g., temperature: 4C)
+    }
+
+    struct Product {
+        // Immutable-ish identity
+        uint256 productId;     // internal numeric id
+        string sku;            // human readable sku or serial
+        string name;           // product name/model
+        string metaHash;       // IPFS/Hash for extra docs (invoice, certificate)
+
+        // Dynamic status
+        address currentOwner;  // who controls the product now
+        State state;           // lifecycle state
+
+        // Timeline
+        uint256 createdAt;
+        Checkpoint[] checkpoints;
+        address[] ownersHistory;
+    }
+
+    // storage
+    uint256 public nextProductId;
+    mapping(uint256 => Product) private products;
+    mapping(string => bool) private skuUsed; // avoid duplicates (optional)
+
+    // indexing helpers (optional)
+    mapping(address => uint256[]) private byOwner;
+
+    // events
+    event ProductRegistered(uint256 indexed productId, string sku, string name, address owner);
+    event OwnershipTransferred(uint256 indexed productId, address from, address to);
+    event CheckpointAdded(uint256 indexed productId, address actor, string location, string note);
+    event StateChanged(uint256 indexed productId, State oldState, State newState);
+
+    modifier onlyOwner(uint256 productId) {
+        require(msg.sender == products[productId].currentOwner, "Not current owner");
+        _;
+    }
+
+    modifier exists(uint256 productId) {
+        require(productId < nextProductId, "Product does not exist");
+        _;
+    }
+
+    // --- Core actions ---
+
+    function registerProduct(
+        string calldata sku,
+        string calldata name,
+        string calldata metaHash
+    ) external returns (uint256 productId) {
+        require(bytes(sku).length > 0, "SKU required");
+        require(!skuUsed[sku], "SKU already used");
+
+        productId = nextProductId++;
+        skuUsed[sku] = true;
+
+        Product storage p = products[productId];
+        p.productId = productId;
+        p.sku = sku;
+        p.name = name;
+        p.metaHash = metaHash;
+        p.currentOwner = msg.sender;
+        p.state = State.Created;
+        p.createdAt = block.timestamp;
+        p.ownersHistory.push(msg.sender);
+
+        byOwner[msg.sender].push(productId);
+
+        // Initial checkpoint (optional)
+        p.checkpoints.push(Checkpoint({
+            time: block.timestamp,
+            actor: msg.sender,
+            location: "Origin",
+            note: "Product registered"
+        }));
+
+        emit ProductRegistered(productId, sku, name, msg.sender);
+    }
+
+    function addCheckpoint(
+        uint256 productId,
+        string calldata location,
+        string calldata note
+    ) external exists(productId) onlyOwner(productId) {
+        Product storage p = products[productId];
+        p.checkpoints.push(Checkpoint({
+            time: block.timestamp,
+            actor: msg.sender,
+            location: location,
+            note: note
+        }));
+
+        emit CheckpointAdded(productId, msg.sender, location, note);
+    }
+
+    function transferOwnership(
+        uint256 productId,
+        address newOwner,
+        string calldata note
+    ) external exists(productId) onlyOwner(productId) {
+        require(newOwner != address(0), "zero addr");
+        Product storage p = products[productId];
+
+        address old = p.currentOwner;
+        p.currentOwner = newOwner;
+        p.ownersHistory.push(newOwner);
+
+        // reindex (optional light cleanup: we won't remove from old owner's list to save gas)
+        byOwner[newOwner].push(productId);
+
+        // auto checkpoint
+        p.checkpoints.push(Checkpoint({
+            time: block.timestamp,
+            actor: msg.sender,
+            location: "Ownership Transfer",
+            note: note
+        }));
+
+        // auto state move hint (optional)
+        if (p.state == State.Created) {
+            _setState(p, State.InTransit);
+        }
+
+        emit OwnershipTransferred(productId, old, newOwner);
+    }
+
+    function setState(uint256 productId, State newState) external exists(productId) onlyOwner(productId) {
+        Product storage p = products[productId];
+        _setState(p, newState);
+    }
+
+    function _setState(Product storage p, State newState) internal {
+        State old = p.state;
+        p.state = newState;
+        emit StateChanged(p.productId, old, newState);
+    }
+
+    // --- Views ---
+
+    function getProduct(uint256 productId)
+        external
+        view
+        exists(productId)
+        returns (
+            string memory sku,
+            string memory name,
+            string memory metaHash,
+            address currentOwner,
+            State state,
+            uint256 createdAt,
+            uint256 checkpointsCount,
+            uint256 ownersCount
+        )
+    {
+        Product storage p = products[productId];
+        return (p.sku, p.name, p.metaHash, p.currentOwner, p.state, p.createdAt, p.checkpoints.length, p.ownersHistory.length);
+    }
+
+    function getCheckpoint(uint256 productId, uint256 index)
+        external
+        view
+        exists(productId)
+        returns (uint256 time, address actor, string memory location, string memory note)
+    {
+        Product storage p = products[productId];
+        require(index < p.checkpoints.length, "bad idx");
+        Checkpoint storage c = p.checkpoints[index];
+        return (c.time, c.actor, c.location, c.note);
+    }
+
+    function getOwners(uint256 productId) external view exists(productId) returns (address[] memory) {
+        return products[productId].ownersHistory;
+    }
+
+    function getProductsByOwner(address owner) external view returns (uint256[] memory) {
+        return byOwner[owner];
+    }
+}
+
+
+
+What this contract gives you
+	•	Register a product with sku, name, and an optional metaHash (e.g., IPFS CID for docs).
+	•	Add checkpoints (location+note) along the journey.
+	•	Transfer ownership (any chain of parties).
+	•	Set state (Created, InTransit, Delivered, Returned, Recalled).
+	•	Query full timeline and ownership history.
