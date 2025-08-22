@@ -1,0 +1,60 @@
+const hre = require("hardhat");
+
+// update after deploy
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
+
+async function main() {
+  if (!CONTRACT_ADDRESS) throw new Error("Set CONTRACT_ADDRESS in .env");
+
+  const [manufacturer, distributor, retailer] = await hre.ethers.getSigners();
+  const sc = await hre.ethers.getContractAt("SupplyChain", CONTRACT_ADDRESS, manufacturer);
+
+  // 1) Register a product by manufacturer
+  const regTx = await sc.registerProduct("SKU-CHOC-001", "Chocolate Bar 70g", "ipfs://bafy...certificate");
+  const regRcpt = await regTx.wait();
+  const productId = Number(regRcpt.logs[0].args.productId); // from ProductRegistered
+  console.log("Registered productId:", productId);
+
+  // 2) Add some checkpoints
+  await (await sc.addCheckpoint(productId, "Factory / Line A", "Batch #B2025-08 cold-chain OK")).wait();
+  await (await sc.setState(productId, 1 /* InTransit */)).wait();
+
+  // 3) Transfer to distributor
+  const scAsManu = sc.connect(manufacturer);
+  await (await scAsManu.transferOwnership(productId, distributor.address, "Handed to logistics provider")).wait();
+
+  // 4) Distributor adds checkpoint
+  const scAsDist = sc.connect(distributor);
+  await (await scAsDist.addCheckpoint(productId, "DC-01 Warehouse", "Temp 5C, Seal intact")).wait();
+
+  // 5) Transfer to retailer
+  await (await scAsDist.transferOwnership(productId, retailer.address, "Out for retail delivery")).wait();
+
+  // 6) Retailer marks delivered
+  const scAsRetail = sc.connect(retailer);
+  await (await scAsRetail.addCheckpoint(productId, "Store #77 Shelf A", "Put on shelf")).wait();
+  await (await scAsRetail.setState(productId, 2 /* Delivered */)).wait();
+
+  // Read back the timeline
+  const product = await sc.getProduct(productId);
+  console.log("Product state:", product);
+
+  const owners = await sc.getOwners(productId);
+  console.log("Owners:", owners);
+
+  const checkpointsCount = Number(product[6]); // checkpointsCount
+  for (let i = 0; i < checkpointsCount; i++) {
+    const c = await sc.getCheckpoint(productId, i);
+    console.log(`Checkpoint #${i}`, {
+      time: Number(c[0]),
+      actor: c[1],
+      location: c[2],
+      note: c[3],
+    });
+  }
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
