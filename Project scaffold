@@ -1,0 +1,21 @@
+mkdir product-tracker
+cd product-tracker
+npm init -y
+npm i --save-dev hardhat @nomicfoundation/hardhat-toolbox
+npm i dotenv
+npx hardhat init
+
+
+
+When asked, choose “Create a JavaScript project”.
+
+Your tree will look like:
+
+
+
+product-tracker/
+  contracts/
+  scripts/
+  test/
+  hardhat.config.js
+  package.json
